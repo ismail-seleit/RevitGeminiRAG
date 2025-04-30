@@ -1,2 +1,3 @@
 python/revit_db/**/*.bin filter=lfs diff=lfs merge=lfs -text
+python/revit_db/*.sqlite3 filter=lfs diff=lfs merge=lfs -text
 python/revit_db/**/*.sqlite3 filter=lfs diff=lfs merge=lfs -text

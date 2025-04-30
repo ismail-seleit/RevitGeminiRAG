@@ -1,46 +1,51 @@
+# -*- coding: utf-8 -*-
 import chromadb
-from chromadb.utils import embedding_functions # <-- Keep this import
-from sentence_transformers import SentenceTransformer # Keep for EF definition, not explicit embedding
+from chromadb.utils import embedding_functions
+# <<< --- IMPORT SentenceTransformer and util --- >>>
+from sentence_transformers import SentenceTransformer, util
 import os
 import sys
 import argparse
 import traceback
 import logging
 import torch
-import json # For parsing LLM output
-import pprint # For nicer printing
-import google.generativeai as genai # <-- Import Google Generative AI
+import json
+import pprint
+import re # For parsing filename
+import google.generativeai as genai
 
 # --- Configuration ---
-# <<< --- CONFIGURATION POINTING TO REFINED CHUNKS DB --- >>>
-persist_directory = r"C:\Users\isele\Documents\RevitAPI_2025\revit_db_arctic" # Path to DB folder
-collection_name = "revit_api_2025_arctic_l_refined_v3" # <-- Use collection with v3 refined chunks
-model_name = 'Snowflake/snowflake-arctic-embed-l-v2.0'      # <-- Model used for indexing v3 chunks
-# <<< --- END CONFIGURATION --- >>>
+persist_directory = r"C:\Users\isele\Documents\RevitAPI_2025\revit_db_arctic"
+collection_name = "revit_api_2025_arctic_l_refined_v3"
+model_name = 'Snowflake/snowflake-arctic-embed-l-v2.0' # Model for RAG embeddings AND few-shot similarity
 
-# <<< --- GEMINI CONFIGURATION --- >>>
-GEMINI_MODEL_NAME = 'gemini-2.0-flash-001' # Use the latest flash model
-# <<< --- END GEMINI CONFIGURATION --- >>>
+# <<< --- ADDED: Configuration for Successful Scripts & Few-Shot --- >>>
+successful_scripts_directory = r"C:\ProgramData\Autodesk\Revit\Addins\2025\GeneratedSuccessfulCode" # <<<--- IMPORTANT: SET THIS PATH
+num_few_shot_examples_to_select = 2 # How many dynamic examples to inject
+# <<< --- END ADDED CONFIGURATION --- >>>
 
-num_results_per_query = 7 # How many results to fetch for EACH refined query
-final_num_results = 15   # How many top results to include in the final prompt after combining
+GEMINI_MODEL_NAME = 'gemini-2.0-flash' # Or your preferred Gemini model
+google_api_key = os.environ.get("GOOGLE_API_KEY") # Get API key once
+
+num_results_per_query = 7
+final_num_results = 15 # RAG results (separate from few-shot)
 
 transformer_device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # --- File Logging Setup ---
 try:
     log_file_path = os.path.join(os.path.expanduser("~"), "Documents", "RevitGeminiRAG_Log.txt")
-    for handler in logging.root.handlers[:]: logging.root.removeHandler(handler) # Clear handlers
+    for handler in logging.root.handlers[:]: logging.root.removeHandler(handler)
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s - %(levelname)s - %(message)s',
                         filename=log_file_path,
                         filemode='a')
-    logging.info(f"--- Python RAG Script Started (Gemini Refinement + RAG) ---")
+    logging.info(f"--- Python RAG Script Started (Gemini Refinement + RAG + Dynamic Few-Shot) ---")
 except Exception as log_setup_ex:
     print(f"PYTHON_ERROR: Failed to configure file logging: {log_setup_ex}", file=sys.stderr)
-    logging = None # Disable logging if setup fails
+    logging = None
 
-# --- Logging Functions ---
+# --- Logging Functions (Unchanged) ---
 def log_error(message):
     print(f"PYTHON_ERROR: {message}", file=sys.stderr)
     print(f"PYTHON_TRACEBACK:\n{traceback.format_exc()}", file=sys.stderr)
@@ -50,18 +55,19 @@ def log_debug(message):
     print(f"PYTHON_DEBUG: {message}", file=sys.stderr)
     if logging: logging.debug(message)
 
-# --- Gemini Query Refinement Function ---
+# --- Gemini Query Refinement Function (Unchanged - Assuming it works well) ---
 def refine_query_with_gemini(original_query, api_key):
-    """
-    Uses Gemini to refine the user query for better RAG retrieval.
-    """
+    # ... (Keep your existing refine_query_with_gemini function here) ...
+    # --- (Ensure it handles fallbacks gracefully if Gemini fails or API key is missing) ---
     log_debug(f"Refining query with Gemini ({GEMINI_MODEL_NAME}): '{original_query}'")
     if not api_key:
-        log_error("GOOGLE_API_KEY is not set. Cannot use Gemini for refinement.")
+        log_debug("GOOGLE_API_KEY is not set. Cannot use Gemini for refinement. Using original query.")
         return [original_query] # Fallback to original query
 
     try:
         genai.configure(api_key=api_key)
+        # Use safety settings similar to your C# code if needed
+        # safety_settings=[...]
         model = genai.GenerativeModel(GEMINI_MODEL_NAME)
 
         # Construct the prompt for Gemini
@@ -111,17 +117,19 @@ def refine_query_with_gemini(original_query, api_key):
 
         Refined JSON List:
         """
-        # log_debug(f"Gemini Prompt:\n{gemini_prompt}") # Uncomment for debugging the prompt
 
         response = model.generate_content(gemini_prompt)
-        # log_debug(f"Raw Gemini Response Text:\n{response.text}") # Uncomment for debugging
 
-        # Clean potential markdown fences if Gemini adds them
-        cleaned_response_text = response.text.strip().removeprefix("```json").removesuffix("```").strip()
+        cleaned_response_text = response.text.strip()
+        if cleaned_response_text.startswith("```json"):
+            cleaned_response_text = cleaned_response_text[7:]
+        if cleaned_response_text.endswith("```"):
+            cleaned_response_text = cleaned_response_text[:-3]
+        cleaned_response_text = cleaned_response_text.strip()
 
         refined_queries = json.loads(cleaned_response_text)
 
-        if isinstance(refined_queries, list) and all(isinstance(q, str) for q in refined_queries) and refined_queries:
+        if isinstance(refined_queries, list) and all(isinstance(q, str) and q.strip() for q in refined_queries) and refined_queries:
             log_debug(f"Gemini returned refined queries: {refined_queries}")
             return refined_queries
         else:
@@ -129,23 +137,71 @@ def refine_query_with_gemini(original_query, api_key):
             return [original_query] # Fallback
 
     except json.JSONDecodeError as e:
-        log_error(f"Error decoding Gemini JSON response: {e}. Raw response: '{response.text}'")
+        log_error(f"Error decoding Gemini JSON response: {e}. Raw response was likely: '{response.text if 'response' in locals() else 'N/A'}'")
         return [original_query] # Fallback
     except Exception as e:
-        # Catch potential Google API errors or other issues
         log_error(f"Error during Gemini query refinement: {e}")
         return [original_query] # Fallback
 
+# <<< --- ADDED: Function to Load Successful Script Metadata --- >>>
+def load_successful_script_metadata(directory):
+    """Scans the directory for .py files matching the naming convention and extracts metadata."""
+    script_metadata = []
+    if not os.path.isdir(directory):
+        log_debug(f"Warning: Successful scripts directory not found or not a directory: {directory}")
+        return script_metadata
+
+    # Regex to capture the prompt part and timestamp (adjust if your format differs slightly)
+    # Assumes format: Prompt_Part_YYYYMMDD_HHMMSS.py
+    # It captures the part before the first YYYYMMDD sequence
+    # filename_regex = re.compile(r"^(.*?)_(\d{8}_\d{6})\.py$")
+    filename_regex = re.compile(r"^(.*?)_(\d{8}_\d{6})\.py$", re.IGNORECASE)
+
+
+    log_debug(f"Scanning for successful scripts in: {directory}")
+    try:
+        for filename in os.listdir(directory):
+            filepath = os.path.join(directory, filename)
+            if filename.lower().endswith(".py") and os.path.isfile(filepath):
+                match = filename_regex.match(filename)
+                if match:
+                    sanitized_prompt = match.group(1)
+                    timestamp = match.group(2)
+                    # Try to "un-sanitize" the prompt (basic: replace underscore with space)
+                    original_prompt_guess = sanitized_prompt.replace('_', ' ').strip()
+                    if original_prompt_guess: # Ensure we have a non-empty prompt guess
+                         script_metadata.append({
+                             "filepath": filepath,
+                             "filename": filename,
+                             "original_prompt": original_prompt_guess,
+                             "timestamp": timestamp
+                         })
+                    else:
+                         log_debug(f"Skipping file {filename}: Could not extract a valid prompt part.")
+                else:
+                     log_debug(f"Skipping file {filename}: Does not match expected naming format.")
+            else:
+                 log_debug(f"Skipping non-matching file or directory: {filename}")
+
+    except Exception as e:
+        log_error(f"Error scanning successful scripts directory '{directory}': {e}")
+
+    log_debug(f"Found {len(script_metadata)} potential successful script examples.")
+    return script_metadata
+# <<< --- END ADDED FUNCTION --- >>>
+
+
 # --- Main Script Logic ---
 if __name__ == "__main__":
-    # --- 0. Argument Parsing ---
-    parser = argparse.ArgumentParser(description='Generate an LLM prompt for a Revit API query using Gemini refinement and RAG.')
+    # --- 0. Argument Parsing & Initial Setup ---
+    parser = argparse.ArgumentParser(description='Generate LLM prompt using Gemini refinement, RAG, and dynamic few-shot examples.')
     parser.add_argument('query', type=str, help='The user query/question for the Revit API.')
 
     original_query_text = None
     client = None
     collection = None
-    google_api_key = None
+    successful_scripts = []
+    sentence_model = None # Initialize sentence model variable
 
     try:
         args = parser.parse_args()
@@ -154,130 +210,179 @@ if __name__ == "__main__":
         if not original_query_text or not original_query_text.strip():
              log_error("Original query text cannot be empty."); sys.exit(1)
 
-        # --- Check for Google API Key ---
-        google_api_key = os.environ.get("GOOGLE_API_KEY")
-        if not google_api_key:
-            # Log as warning, not error, as script can fallback
-            log_debug("Warning: GOOGLE_API_KEY environment variable not set. Will fallback to using original query for retrieval.")
-        else:
-            log_debug("GOOGLE_API_KEY found. Gemini refinement will be attempted.")
+        # <<< --- Load Successful Script Metadata EARLY --- >>>
+        successful_scripts = load_successful_script_metadata(successful_scripts_directory)
 
+        # <<< --- Instantiate Sentence Transformer Model ONCE --- >>>
+        # We need it for both few-shot similarity and potentially later for RAG if EF wasn't used
+        log_debug(f"Loading Sentence Transformer model: {model_name} on device: {transformer_device}")
+        sentence_model = SentenceTransformer(model_name, device=transformer_device, trust_remote_code=True) # trust_remote_code often needed
+        log_debug("Sentence Transformer model loaded.")
+
+        # Log other config details (unchanged)
         log_debug(f"Using ChromaDB path: {os.path.abspath(persist_directory)}")
         log_debug(f"Using collection: {collection_name}")
-        log_debug(f"Using embedding model for queries: {model_name} via Chroma EF")
-        log_debug(f"Retrieving {num_results_per_query} results per refined query, aiming for {final_num_results} final results.")
+        log_debug(f"Retrieving {num_results_per_query} RAG results per refined query, aiming for {final_num_results} final RAG results.")
+        log_debug(f"Attempting to select {num_few_shot_examples_to_select} dynamic few-shot examples.")
 
     except Exception as e: log_error(f"Error during initial setup or argument parsing: {e}"); sys.exit(1)
 
+
     # --- 1. Refine Query with Gemini ---
-    # This function now handles the Gemini call and fallbacks
     refined_queries = refine_query_with_gemini(original_query_text, google_api_key)
-    if not refined_queries: # Should theoretically always contain at least the original query
-         log_error("Query refinement failed unexpectedly and returned empty list."); sys.exit(1)
-    log_debug(f"Using queries for retrieval: {refined_queries}") # Log the queries actually used
+    log_debug(f"Using queries for RAG retrieval: {refined_queries}")
 
-    # --- 2. Connect to ChromaDB ---
+
+    # --- 2. Select Dynamic Few-Shot Examples ---
+    selected_few_shot_examples_formatted = ""
+    if successful_scripts and sentence_model and num_few_shot_examples_to_select > 0:
+        log_debug("Selecting dynamic few-shot examples based on similarity...")
+        try:
+            # Embed the current user query
+            current_query_embedding = sentence_model.encode([original_query_text], convert_to_tensor=True, device=transformer_device)
+
+            # Embed the original prompts from the successful scripts
+            example_prompts = [script['original_prompt'] for script in successful_scripts]
+            example_prompt_embeddings = sentence_model.encode(example_prompts, convert_to_tensor=True, device=transformer_device)
+
+            # Calculate Cosine Similarity
+            cosine_scores = util.cos_sim(current_query_embedding, example_prompt_embeddings)[0] # Get scores for the single current query
+
+            # Get top N indices (add check to ensure we don't ask for more than available)
+            num_to_get = min(num_few_shot_examples_to_select, len(successful_scripts))
+            top_results = torch.topk(cosine_scores, k=num_to_get)
+
+            log_debug(f"Top {num_to_get} few-shot example candidates (score | index | prompt):")
+            selected_examples_parts = []
+            for i in range(num_to_get):
+                score = top_results.values[i].item()
+                idx = top_results.indices[i].item()
+                selected_script_meta = successful_scripts[idx]
+                log_debug(f"  - {score:.4f} | {idx} | '{selected_script_meta['original_prompt']}' ({selected_script_meta['filename']})")
+
+                # Read the selected script's code
+                try:
+                    with open(selected_script_meta['filepath'], 'r', encoding='utf-8') as f:
+                        script_code = f.read()
+
+                    # Format the example for the prompt
+                    example_part = f"--- Start Dynamic Example {i+1} ---\n"
+                    example_part += f"USER QUESTION EXAMPLE:\n---\n{selected_script_meta['original_prompt']}\n---\n\n" # Use the parsed prompt
+                    example_part += f"PYTHON SCRIPT EXAMPLE:\n```python\n{script_code}\n```\n"
+                    example_part += f"--- End Dynamic Example {i+1} ---"
+                    selected_examples_parts.append(example_part)
+
+                except Exception as read_ex:
+                    log_error(f"Failed to read selected few-shot script '{selected_script_meta['filepath']}': {read_ex}")
+                    # Optionally: continue to next best, or just skip this one
+
+            selected_few_shot_examples_formatted = "\n\n".join(selected_examples_parts)
+
+        except Exception as few_shot_ex:
+            log_error(f"Error during dynamic few-shot example selection: {few_shot_ex}")
+            selected_few_shot_examples_formatted = "# Error selecting dynamic few-shot examples." # Placeholder indicating failure
+
+    elif not successful_scripts:
+         log_debug("Skipping dynamic few-shot selection: No successful script metadata loaded.")
+         selected_few_shot_examples_formatted = "# No successful script examples were found to include."
+    else:
+         log_debug(f"Skipping dynamic few-shot selection: num_few_shot_examples_to_select is {num_few_shot_examples_to_select}.")
+         selected_few_shot_examples_formatted = "# Dynamic few-shot examples disabled by configuration."
+
+
+    # --- 3. Connect to ChromaDB and Perform RAG Query ---
+    context_documents = [] # Initialize RAG context
     if not os.path.isdir(persist_directory):
-        log_error(f"ChromaDB directory not found at: {os.path.abspath(persist_directory)}"); sys.exit(1)
-    try:
-        log_debug(f"Connecting to ChromaDB at: {persist_directory}")
-        client = chromadb.PersistentClient(path=persist_directory)
-        log_debug(f"Configuring embedding function for Chroma collection ('{model_name}')...")
-        # Configure EF using the correct model name
-        embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
-            model_name=model_name, device=transformer_device, trust_remote_code=True) # trust_remote_code needed for some SentenceTransformer models
-        log_debug(f"Getting collection: {collection_name}")
-        # Get collection associated with the EF
-        collection = client.get_collection(name=collection_name, embedding_function=embedding_function)
-        log_debug(f"Successfully connected to collection '{collection_name}'. Count: {collection.count()}")
-    except Exception as e: log_error(f"Error accessing ChromaDB collection '{collection_name}': {e}"); sys.exit(1)
+        log_error(f"ChromaDB directory not found at: {os.path.abspath(persist_directory)}"); # sys.exit(1) - Maybe don't exit, try to proceed without RAG? Or handle later.
+    else:
+        try:
+            log_debug(f"Connecting to ChromaDB at: {persist_directory}")
+            client = chromadb.PersistentClient(path=persist_directory)
 
-    # --- 3. Query ChromaDB with Refined Queries ---
-    all_results_dict = {} # Use dict to store best result per ID {id: {'doc':..., 'meta':..., 'dist':...}}
-    context_documents = [] # Initialize in case of errors
-    try:
-        log_debug(f"Querying ChromaDB with {len(refined_queries)} refined queries...")
-        # Let Chroma handle embedding the query texts using the collection's EF
-        results = collection.query(
-            query_texts=refined_queries, # Pass the list of refined query strings
-            n_results=num_results_per_query,
-            include=['metadatas', 'documents', 'distances']
-        )
+            # Define EF *inside* the try block for ChromaDB connection
+            embedding_function = embedding_functions.SentenceTransformerEmbeddingFunction(
+                model_name=model_name, device=transformer_device, trust_remote_code=True
+            )
+            log_debug(f"Getting collection: {collection_name} with EF: {model_name}")
+            collection = client.get_collection(name=collection_name, embedding_function=embedding_function)
+            log_debug(f"Connected to collection '{collection_name}'. Count: {collection.count()}")
 
-        # --- 4. Combine, De-duplicate, and Rank Results ---
-        log_debug("Combining and de-duplicating results...")
-        if results and results.get('ids'):
-            # Iterate through results for each refined query
-            # Note: results['ids'] is a list of lists, one inner list per query_text
-            for i in range(len(results['ids'])): # Index corresponds to refined_queries[i]
-                 # Check if the current query actually returned results and ids are not None
-                if results['ids'][i] is None or not results['ids'][i]:
-                    log_debug(f"No results found for refined query {i+1}: '{refined_queries[i]}'")
-                    continue
+            # --- 4. Query ChromaDB with Refined Queries (RAG part) ---
+            log_debug(f"Querying ChromaDB for RAG context with {len(refined_queries)} refined queries...")
+            results = collection.query(
+                query_texts=refined_queries,
+                n_results=num_results_per_query,
+                include=['metadatas', 'documents', 'distances']
+            )
 
-                query_ids = results['ids'][i]
-                query_docs = results['documents'][i]
-                query_metas = results['metadatas'][i]
-                query_dists = results['distances'][i]
+            # --- 5. Combine, De-duplicate, and Rank RAG Results ---
+            all_results_dict = {}
+            log_debug("Combining and de-duplicating RAG results...")
+            # ... (Your existing result processing logic - keep the version from the previous step
+            #      that handles potential metadata differences if you indexed scripts there too) ...
+            # --- (Ensure this logic correctly extracts 'document' from the RAG results) ---
+            if results and results.get('ids'):
+                for i in range(len(results['ids'])): # Index corresponds to refined_queries[i]
+                    if results['ids'][i] is None or not results['ids'][i]:
+                        # log_debug(f"No RAG results found for refined query {i+1}: '{refined_queries[i]}'")
+                        continue
 
-                # Ensure all lists have the same length for this query's results
-                if not (len(query_ids) == len(query_docs) == len(query_metas) == len(query_dists)):
-                    log_error(f"Inconsistent result lengths for query {i+1}. Skipping.")
-                    continue
+                    if (results.get('documents') is None or len(results['documents']) <= i or results['documents'][i] is None or
+                        results.get('metadatas') is None or len(results['metadatas']) <= i or results['metadatas'][i] is None or
+                        results.get('distances') is None or len(results['distances']) <= i or results['distances'][i] is None or
+                        not (len(results['ids'][i]) == len(results['documents'][i]) == len(results['metadatas'][i]) == len(results['distances'][i]))):
+                        log_error(f"Inconsistent RAG result data structure for query {i+1}. Skipping.")
+                        continue
 
-                for j in range(len(query_ids)):
-                    doc_id = query_ids[j]
-                    distance = query_dists[j]
-                    document = query_docs[j]
-                    metadata = query_metas[j]
+                    query_ids = results['ids'][i]
+                    query_docs = results['documents'][i]
+                    query_metas = results['metadatas'][i]
+                    query_dists = results['distances'][i]
 
-                    # Basic check for valid data before processing
-                    if not doc_id or document is None or metadata is None or distance is None:
-                         log_debug(f"Skipping invalid result entry (ID: {doc_id}) for query {i+1}.")
-                         continue
+                    for j in range(len(query_ids)):
+                        doc_id = query_ids[j]
+                        distance = query_dists[j]
+                        document = query_docs[j]
+                        metadata = query_metas[j]
 
-                    # If ID is new OR this result is better (lower distance) than existing, store it
-                    if doc_id not in all_results_dict or distance < all_results_dict[doc_id]['distance']:
-                        all_results_dict[doc_id] = {
-                            'document': document,
-                            'metadata': metadata,
-                            'distance': distance,
-                            'id': doc_id # Store id for debugging if needed
-                        }
+                        if not doc_id or document is None or metadata is None or distance is None:
+                            # log_debug(f"Skipping invalid RAG result entry (ID: {doc_id}) for query {i+1}.")
+                            continue
 
-            log_debug(f"Found {len(all_results_dict)} unique results from refined queries.")
+                        if doc_id not in all_results_dict or distance < all_results_dict[doc_id]['distance']:
+                            all_results_dict[doc_id] = {
+                                'document': document,
+                                'metadata': metadata,
+                                'distance': distance,
+                                'id': doc_id
+                            }
 
-            # Sort unique results by distance (ascending)
-            sorted_results = sorted(all_results_dict.values(), key=lambda item: item['distance'])
+                log_debug(f"Found {len(all_results_dict)} unique RAG results from refined queries.")
+                sorted_results = sorted(all_results_dict.values(), key=lambda item: item['distance'])
+                top_results = sorted_results[:final_num_results]
+                log_debug(f"Selected top {len(top_results)} RAG results after ranking.")
+                context_documents = [res['document'] for res in top_results] # Just get the text content for RAG
 
-            # Get the top N final results
-            top_results = sorted_results[:final_num_results]
-            log_debug(f"Selected top {len(top_results)} results after ranking.")
+                # Optional: Log RAG results details (simplified logging)
+                # for k, res in enumerate(top_results):
+                #     log_debug(f"  RAG Result {k+1}: ID={res.get('id','N/A')} | Dist={res.get('distance', -1):.4f}")
 
-            context_documents = [res['document'] for res in top_results]
-            # Log retrieved results details
-            for i, res in enumerate(top_results):
-                 snippet = repr(res['document'][:100]) if res.get('document') else "N/A"
-                 meta = res.get('metadata', {})
-                 dist = res.get('distance', float('inf'))
-                 log_debug(f"  Final Result {i+1}: ID={res.get('id','N/A')} | Distance={dist:.4f} | API={meta.get('api_element_name', 'N/A')} | Type={meta.get('element_type','N/A')} | Snippet={snippet}...")
+            else:
+                log_debug("Warning: No relevant RAG documents found in ChromaDB.")
+                context_documents = []
 
-        else:
-            log_debug("Warning: No relevant documents found in ChromaDB for any refined query.")
-            context_documents = [] # Ensure empty if no results
+        except Exception as e:
+            log_error(f"Error querying ChromaDB or processing RAG results: {e}")
+            context_documents = [] # Ensure context_documents is empty on error
 
-    except Exception as e:
-        log_error(f"Error querying ChromaDB or processing results: {e}")
-        context_documents = [] # Ensure context_documents is empty on error
-
-    # --- 5. Construct the Final Prompt ---
+    # --- 6. Construct the Final Prompt ---
     log_debug("Constructing final prompt for code generation LLM...")
     context_string = "\n\n---\n\n".join(context_documents)
 
-    # <<< FINAL PROMPT TEMPLATE (No changes needed here - it uses the ORIGINAL query) >>>
+    # <<< *** UPDATED FINAL PROMPT TEMPLATE with Dynamic Few-Shot Placeholder and EXCEL format support *** >>>
     prompt_template = """ROLE: You are an expert Revit API assistant generating Python code.
 
-TASK: Generate Python code only, suitable for direct execution in Revit Python Shell or pyRevit using IronPython. Follow the format demonstrated in the example below.
+TASK: Generate Python code only, suitable for direct execution in Revit Python Shell or pyRevit using IronPython. Follow the format demonstrated in the examples below.
 
 RESPONSE FORMAT:
 - Output ONLY Python code.
@@ -296,15 +401,36 @@ CRITICAL CONSTRAINTS:
 - DO NOT manage Revit Transactions (NO `Transaction()`, `t.Start()`, `t.Commit()`). The C# wrapper handles this. Write only the core API calls.
 - DO NOT generate code that requires user interaction (e.g., selecting files, showing dialogs). The entire operation must be driven by the initial prompt.
 
-OTHER INSTRUCTIONS:
-- Base your code primarily on the classes, methods, and patterns found in the CONTEXT section provided below. Prioritize context examples.
-- Import necessary classes explicitly (e.g., `from Autodesk.Revit.DB import ...`). Ensure all required classes are imported.
-- Be mindful of Revit's internal units (typically decimal feet for lengths). Convert user units (like inches or mm) if necessary, as shown in the example.
-- If the user request is ambiguous, add Python comments (`#`) explaining assumptions made or what input might be needed.
-- If the task is impossible via API, output ONLY a single Python comment line explaining why (e.g., `# Error: API does not support this operation.`).
+CODE QUALITY & IMPORT REQUIREMENTS:
+- **Mandatory Imports:** Ensure ALL required classes from `Autodesk.Revit.DB` and necessary .NET types are imported explicitly at the start using `from Autodesk.Revit.DB import ...`. Assume standard Revit API assemblies are referenced, but use `clr.AddReference()` if needed. Missing imports are a common failure point.
+- **Syntactic Correctness:** Write syntactically correct Python code valid for IronPython. Aim for code that runs without syntax errors.
+- **Leverage Examples:** Pay close attention to the DYNAMIC FEW-SHOT EXAMPLES and STATIC EXAMPLES provided below. These demonstrate correct syntax and patterns. Prioritize these examples when relevant.
+- **Context First:** Also consider the patterns found in the RAG CONTEXT FROM DOCUMENTATION section provided below.
+- **Units:** Be mindful of Revit's internal units (decimal feet).
+- **Ambiguity:** If the request is ambiguous, add Python comments (`#`) explaining assumptions.
+- **Impossible Tasks:** If impossible via API, output ONLY `# Error: [Reason]`.
 
---- EXAMPLE START ---
+DATA EXPORT HANDLING:
+- If the user request asks to EXPORT or SAVE data:
+    1. Collect and format the data as a single string (e.g., CSV lines with '\n').
+    2. PRINT the output in the specific format:
+       ```
+       EXPORT::[FORMAT]::[FILENAME_SUGGESTION]
+       [DATA_CONTENT_STRING]
+       ```
+       (Replace FORMAT with CSV/TXT/EXCEL, FILENAME_SUGGESTION appropriately. Ensure a newline separates header and data.)
+       For EXCEL exports, use the same CSV format for data but specify EXCEL as the format.
+    3. Do NOT print anything else if exporting data.
 
+--- DYNAMIC FEW-SHOT EXAMPLES (Most Relevant to Current Query) ---
+{dynamic_examples_placeholder}
+--- END DYNAMIC FEW-SHOT EXAMPLES ---
+
+
+--- STATIC EXAMPLES (General Formatting and Common Tasks) ---
+
+--- EXAMPLE 1 START (Modify Elements) ---
+# ... (Your Example 1 from previous version) ...
 USER QUESTION EXAMPLE:
 ---
 select all walls thicker than 6 inches in view
@@ -312,6 +438,8 @@ select all walls thicker than 6 inches in view
 
 PYTHON SCRIPT EXAMPLE:
 # Import necessary classes
+import clr
+clr.AddReference('System.Collections') # Required for List<T>
 from Autodesk.Revit.DB import FilteredElementCollector, BuiltInCategory, Wall, ElementId
 from System.Collections.Generic import List
 
@@ -322,53 +450,185 @@ min_thickness_feet = 0.5
 try:
     active_view_id = doc.ActiveView.Id
 except AttributeError:
-    # Handle case where there might not be an active view or it's not suitable
     print("# Error: Could not get active view ID. Cannot filter by view.")
-    active_view_id = ElementId.InvalidElementId # Use invalid ID to prevent collection
+    active_view_id = ElementId.InvalidElementId
 
-# List to store IDs of walls meeting the criteria
 walls_to_select_ids = []
-
-# Proceed only if we have a valid view ID
 if active_view_id != ElementId.InvalidElementId:
-    # Create a filtered element collector for walls in the active view
     collector = FilteredElementCollector(doc, active_view_id)
     wall_collector = collector.OfCategory(BuiltInCategory.OST_Walls).WhereElementIsNotElementType()
-
-    # Iterate through walls and check their thickness
     for wall in wall_collector:
-        # Ensure it's a valid Wall object before accessing Width property
         if isinstance(wall, Wall):
             try:
-                # Wall.Width returns thickness in internal units (feet)
                 wall_thickness = wall.Width
                 if wall_thickness > min_thickness_feet:
                     walls_to_select_ids.append(wall.Id)
             except Exception as e:
-                # Some wall types might not have a typical Width property, skip them
-                # print(f"# Debug: Skipping element {{wall.Id}}, could not get Width. Error: {{e}}") # Optional debug - NOTE ESCAPED BRACES {{e}}
+                # print(f"# Debug: Skipping element {{wall.Id}}, could not get Width. Error: {{e}}") # Escaped
                 pass # Silently skip walls where Width cannot be accessed
 
-# Select the elements found (or clear selection if none found/view invalid)
-# Use System.Collections.Generic.List for interop with C#/.NET selection method
 selection_list = List[ElementId](walls_to_select_ids)
 try:
     uidoc.Selection.SetElementIds(selection_list)
-    # Optional status message (commented out)
-    # if walls_to_select_ids:
-    #     print(f"# Selected {{len(walls_to_select_ids)}} walls thicker than 6 inches.") # NOTE ESCAPED BRACES
-    # else:
-    #     print("# No walls found matching the criteria in the active view.")
+    # print(f"# Selected {{len(walls_to_select_ids)}} walls.") # Escaped Optional output
 except Exception as sel_ex:
-    print(f"# Error setting selection: {{sel_ex}}") # NOTE ESCAPED BRACES {{sel_ex}}
+    print(f"# Error setting selection: {{sel_ex}}") # Escaped
 
+--- EXAMPLE 1 END ---
 
---- EXAMPLE END ---
-
-CONTEXT FROM REVIT API DOCUMENTATION:
+--- EXAMPLE 2 START (Export Data to CSV) ---
+# ... (Your Example 2 from previous version) ...
+USER QUESTION EXAMPLE:
 ---
+export the name and area of all floors to a csv file
+---
+
+PYTHON SCRIPT EXAMPLE:
+# Import necessary classes
+import clr
+clr.AddReference('RevitAPI') # Assumed standard ref
+clr.AddReference('RevitAPIUI') # Assumed standard ref
+# Explicit DB imports are key
+from Autodesk.Revit.DB import FilteredElementCollector, BuiltInCategory, Floor, UnitUtils, DisplayUnitType, BuiltInParameter
+from System.Collections.Generic import List # Example of needing .NET list
+
+# List to hold CSV lines
+csv_lines = []
+# Add header row
+csv_lines.append("Floor Name,Area (sq ft)") # Example header
+
+# Collect all Floor elements
+collector = FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_Floors).WhereElementIsNotElementType()
+
+# Iterate through floors and get data
+for floor in collector:
+    if isinstance(floor, Floor):
+        try:
+            name = floor.Name
+            # Get area parameter (HOST_AREA_COMPUTED is common for floors)
+            area_param = floor.get_Parameter(BuiltInParameter.HOST_AREA_COMPUTED)
+            if area_param:
+                area_value_internal = area_param.AsDouble()
+                area_str = "{{:.2f}}".format(area_value_internal) # Escaped format specifier
+            else:
+                area_str = "N/A"
+
+            # Escape commas in name if necessary (basic CSV handling)
+            safe_name = '"' + name.replace('"', '""') + '"'
+            csv_lines.append(f"{{safe_name}},{{area_str}}") # Escaped f-string variables
+        except Exception as e:
+            pass # Skip floors that cause errors
+
+# Check if we gathered any data
+if len(csv_lines) > 1: # More than just the header
+    # Format the final output for export
+    file_content = "\\n".join(csv_lines)
+    print("EXPORT::CSV::floor_areas.csv") # <-- The marker line
+    print(file_content)                 # <-- The data content string
+else:
+    print("# No floor elements found or processed.")
+
+--- EXAMPLE 2 END ---
+
+--- EXAMPLE 3 START (Export Data to TXT) ---
+# ... (Your Example 3 from previous version) ...
+USER QUESTION EXAMPLE:
+---
+list all view names and their view type in a text file
+---
+
+PYTHON SCRIPT EXAMPLE:
+# Import necessary classes
+from Autodesk.Revit.DB import FilteredElementCollector, View
+
+# List to hold text lines
+text_lines = []
+text_lines.append("Revit Views Report")
+text_lines.append("==================")
+
+# Collect all View elements
+collector = FilteredElementCollector(doc).OfClass(View)
+
+# Iterate through views and get data
+for view in collector:
+    if isinstance(view, View):
+        try:
+            name = view.Name
+            view_type_enum = view.ViewType # Get the enum value
+            view_type = view_type_enum.ToString() # Convert enum to string
+            text_lines.append(f"Name: {{name}} | Type: {{view_type}}") # Escaped f-string variables
+        except Exception as e:
+            pass # Skip views that cause errors
+
+# Check if we gathered any data
+if len(text_lines) > 2: # More than just the header lines
+    # Format the final output for export
+    file_content = "\\n".join(text_lines)
+    print("EXPORT::TXT::view_list.txt") # <-- The marker line
+    print(file_content)                # <-- The data content string
+else:
+    print("# No view elements found or processed.")
+
+--- EXAMPLE 3 END ---
+
+--- EXAMPLE 4 START (Export Data to Excel) ---
+USER QUESTION EXAMPLE:
+---
+export wall data to excel
+---
+
+PYTHON SCRIPT EXAMPLE:
+# Import necessary classes
+import clr
+from Autodesk.Revit.DB import FilteredElementCollector, BuiltInCategory, Wall, BuiltInParameter
+
+# List to hold CSV lines (Excel format uses CSV data with EXCEL marker)
+csv_lines = []
+# Add header row
+csv_lines.append("Wall ID,Family,Type,Length,Height")
+
+# Collect all Wall elements
+collector = FilteredElementCollector(doc).OfCategory(BuiltInCategory.OST_Walls).WhereElementIsNotElementType()
+
+# Iterate through walls and get data
+for wall in collector:
+    if isinstance(wall, Wall):
+        try:
+            wall_id = wall.Id.IntegerValue
+            family_param = wall.get_Parameter(BuiltInParameter.ELEM_FAMILY_PARAM)
+            family_name = family_param.AsValueString() if family_param else "N/A"
+            type_param = wall.get_Parameter(BuiltInParameter.ELEM_TYPE_PARAM)
+            type_name = type_param.AsValueString() if type_param else "N/A"
+            length_param = wall.get_Parameter(BuiltInParameter.CURVE_ELEM_LENGTH)
+            length = length_param.AsDouble() if length_param else 0
+            height_param = wall.get_Parameter(BuiltInParameter.WALL_USER_HEIGHT_PARAM)
+            height = height_param.AsDouble() if height_param else 0
+            
+            # Format the row with quoted strings to handle commas
+            safe_family = f'"{{family_name}}"' if ',' in family_name else family_name
+            safe_type = f'"{{type_name}}"' if ',' in type_name else type_name
+            csv_lines.append(f"{{wall_id}},{{safe_family}},{{safe_type}},{{length:.2f}},{{height:.2f}}")
+        except Exception as e:
+            pass # Skip walls that cause errors
+
+# Check if we gathered any data
+if len(csv_lines) > 1: # More than just the header
+    # Format the final output for export as Excel
+    file_content = "\n".join(csv_lines)
+    print("EXPORT::EXCEL::wall_data.xlsx") # <-- Note EXCEL format specified
+    print(file_content)                    # <-- The data content string (same CSV format)
+else:
+    print("# No wall elements found or processed.")
+
+--- EXAMPLE 4 END ---
+
+--- END STATIC EXAMPLES ---
+
+
+--- RAG CONTEXT FROM DOCUMENTATION (Less reliable than examples) ---
 {context_placeholder}
----
+--- END RAG CONTEXT ---
+
 
 USER QUESTION:
 ---
@@ -379,27 +639,42 @@ PYTHON SCRIPT:
 """ # End of the prompt_template definition
 
     try:
-        if '{context_placeholder}' not in prompt_template or '{query_placeholder}' not in prompt_template:
-             log_error("Prompt template is missing required placeholders."); sys.exit(1)
-        # Use the ORIGINAL user query in the final prompt for the generation LLM
+        # Validate placeholders
+        required_placeholders = ['{dynamic_examples_placeholder}', '{context_placeholder}', '{query_placeholder}']
+        if not all(p in prompt_template for p in required_placeholders):
+             missing = [p for p in required_placeholders if p not in prompt_template]
+             log_error(f"Prompt template is missing required placeholders: {missing}"); sys.exit(1)
+
+        # Escape braces in dynamic content BEFORE formatting the main template
+        safe_dynamic_examples = selected_few_shot_examples_formatted.replace('{', '{{').replace('}', '}}')
+        safe_context_string = context_string.replace('{', '{{').replace('}', '}}')
+        safe_query_placeholder = original_query_text.replace('{', '{{').replace('}', '}}')
+
+        # Use the escaped strings in the format call
         prompt_for_llm = prompt_template.format(
-            context_placeholder=(context_string if context_string else "# No relevant documentation snippets found."),
-            query_placeholder=original_query_text # Use the original, unmodified query here
+            dynamic_examples_placeholder=safe_dynamic_examples,
+            context_placeholder=(safe_context_string if context_string else "# No relevant documentation snippets found."),
+            query_placeholder=safe_query_placeholder
         )
+
     except KeyError as key_err:
-         log_error(f"Error formatting the prompt string: Missing key {key_err}."); sys.exit(1)
+         log_error(f"Error formatting the prompt string: Missing key {key_err}. Check template placeholders."); sys.exit(1)
     except Exception as fmt_ex:
         log_error(f"Error formatting the prompt string: {fmt_ex}"); sys.exit(1)
 
-    # --- 6. Output the Final Prompt ---
-    print(prompt_for_llm) # Print to stdout for the C# wrapper
+    # --- 7. Output the Final Prompt ---
+    try:
+        output_bytes = prompt_for_llm.encode('utf-8')
+        sys.stdout.buffer.write(output_bytes)
+        sys.stdout.flush()
+    except Exception as write_ex:
+        log_error(f"Error writing prompt to stdout: {write_ex}")
+        print(prompt_for_llm) # Fallback
+
     log_debug("Successfully generated and printed final LLM prompt to stdout.")
     if logging: logging.info("--- Python RAG Script Finished Successfully ---")
-    sys.exit(0) # Success exit code
+    sys.exit(0)
 
 # --- Error Exit ---
-# This part is reached if sys.exit(1) was called earlier
-# Note: sys.exit() terminates the script, so this might not always execute in practice
-# depending on where the exit occurs, but it's good practice conceptually.
 if logging: logging.error("--- Python RAG Script Exited with Error ---")
-# The sys.exit(1) call already happened if there was an error needing termination.
+# sys.exit(1) would have already been called if termination was needed.

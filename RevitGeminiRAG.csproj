@@ -191,6 +191,7 @@
     </Compile>
     <Compile Include="RunRAGCommand.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="StressTestRAGCommand.cs" />
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="PromptForm.resx">
